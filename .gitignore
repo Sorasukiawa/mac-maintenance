@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.venv/
+/work/
+/outputs/
+/config/preferences.local.json
+*.jsonl
+*.log
+.env
+.env.*
