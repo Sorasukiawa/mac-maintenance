@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mac 维护"
+  short_description: "检查 Mac 软硬件更新，按已有授权整理清理，并核实实际结果"
+  default_prompt: "使用 $mac-maintenance 检查这台 Mac，并在本次授权范围内完成更新、整理和清理。"
