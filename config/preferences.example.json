@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "skip_update_bundle_ids": ["com.example.VideoEditor"],
+  "manager_only_bundle_prefixes": {
+    "com.example.vendor.": "Vendor Update Manager"
+  },
+  "protect_paths": [],
+  "remove_old_versions_if_replacement_verified": true
+}

@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "skip_update_bundle_ids": [],
+  "manager_only_bundle_prefixes": {},
+  "protect_paths": [],
+  "remove_old_versions_if_replacement_verified": true
+}
