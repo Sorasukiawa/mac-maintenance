@@ -3,13 +3,15 @@
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import platform
 import shutil
 import sys
 
-from maintenance_common import (DEFAULT_PREFERENCES, command, emit, inventory, now,
-                                preferences, redact_hardware, write_new)
+from maintenance_common import (DEFAULT_PREFERENCES, LOCAL_PREFERENCES, command, emit,
+                                inventory, now, preferences, redact_hardware,
+                                redact_text, write_new)
 
 
 def system_checks(quick, online):
@@ -51,6 +53,11 @@ def system_checks(quick, online):
                     result["data"] = redact_hardware(json.loads(raw))
                 except ValueError:
                     result.update(status="unknown", error="invalid_profiler_json")
+        elif name in ("backup_status", "backup_latest"):
+            if "stdout" in result:
+                result["stdout"] = redact_text(result["stdout"])
+            if "stderr" in result:
+                result["stderr"] = redact_text(result["stderr"])
         return name, result
 
     with ThreadPoolExecutor(max_workers=4) as pool:
@@ -76,40 +83,76 @@ def system_checks(quick, online):
 
 def storage_checks(roots):
     def run(path):
-        path = Path(path).expanduser()
-        if path.is_symlink():
+        path = Path(os.path.abspath(Path(path).expanduser()))
+        if path.is_symlink() or path.resolve() != path:
             return {"path": str(path), "status": "unknown", "allocated_bytes": None,
-                    "reason": "symbolic_link_skipped"}
-        result = command(["/usr/bin/du", "-xsk", str(path)], 15)
+                    "partial_allocated_bytes": None, "reason": "symbolic_link_skipped"}
+        result = command(["/usr/bin/du", "-xsk", "--", str(path)], 15)
         item = {"path": str(path), "status": result["status"], "allocated_bytes": None,
-                "evidence": result, "candidate_status": "requires_purpose_and_activity_review"}
-        if result["status"] == "ok" and not result.get("stderr"):
+                "partial_allocated_bytes": None, "evidence": result,
+                "candidate_status": "requires_purpose_and_activity_review"}
+        parsed = None
+        if result.get("stdout"):
             try:
-                item["allocated_bytes"] = int(result["stdout"].split()[0]) * 1024
+                parsed = int(result["stdout"].split()[0]) * 1024
             except (ValueError, IndexError):
-                item["status"] = "unknown"
+                parsed = None
+        if result["status"] == "ok" and not result.get("stderr") and parsed is not None:
+            item["allocated_bytes"] = parsed
         else:
             item["status"] = "unknown"
+            if parsed is not None and path.exists():
+                item["partial_allocated_bytes"] = parsed
         return item
     with ThreadPoolExecutor(max_workers=4) as pool:
         return list(pool.map(run, roots))
 
 
+def check_summary(name, item):
+    if item.get("status") != "ok":
+        return str(item.get("error") or item.get("reason") or item.get("stderr", "").strip().splitlines()[:1] or "-")
+    stdout = item.get("stdout", "").strip()
+    if name == "system":
+        return " / ".join(line.strip() for line in stdout.splitlines() if line.strip())
+    if name == "disk_free":
+        rows = [line.split() for line in stdout.splitlines() if line.strip()]
+        if len(rows) >= 2 and len(rows[-1]) >= 4:
+            try:
+                return f"可用 {int(rows[-1][3]) * 1024 / 1024**3:.2f} GiB"
+            except ValueError:
+                pass
+    if name == "brew_outdated_local_metadata":
+        try:
+            data = json.loads(stdout)
+            return f"formulae {len(data.get('formulae', []))} 个, casks {len(data.get('casks', []))} 个"
+        except ValueError:
+            pass
+    if name in ("hardware", "peripherals"):
+        return "已采集脱敏 JSON"
+    first = next((line.strip() for line in stdout.splitlines() if line.strip()), "-")
+    return first[:80] + ("..." if len(first) > 80 else "")
+
+
 def report(result):
+    def cell(value):
+        return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
     lines = ["# Mac 维护检查", "", "检查时间：" + result["generated_at"], "",
              "本报告是只读盘点。更新匹配、专业软件可用性、驱动适用性与清理边界仍按 Skill 核实。", "",
              f"应用 {len(result['applications'])} 个；未覆盖或需补查 {len(result['coverage_gaps'])} 项。", "",
-             "## 系统检查", "", "| 检查 | 状态 |", "|---|---|"]
+             "## 系统检查", "", "| 检查 | 状态 | 摘要 |", "|---|---|---|"]
     for name, item in result["checks"].items():
-        lines.append(f"| {name} | {item['status']} |")
+        lines.append(f"| {cell(name)} | {cell(item['status'])} | {cell(check_summary(name, item))} |")
     lines += ["", "## 应用", "", "| 应用 | 版本 / build | 更新规则 |", "|---|---|---|"]
-    def cell(value):
-        return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
     for item in result["applications"]:
         lines.append(f"| {cell(item['name'])} | {cell(item['version'])} / {cell(item['build'])} | {cell(item['update_policy']['mode'])} |")
     lines += ["", "## 目录占用", "", "这些数值不代表可清理容量，父子目录可能重叠。", ""]
     for item in result["storage"]:
-        size = "未确认" if item["allocated_bytes"] is None else f"{item['allocated_bytes'] / 1024**3:.2f} GiB"
+        if item["allocated_bytes"] is not None:
+            size = f"{item['allocated_bytes'] / 1024**3:.2f} GiB"
+        elif item.get("partial_allocated_bytes") is not None:
+            size = f"未确认，可读部分约 {item['partial_allocated_bytes'] / 1024**3:.2f} GiB"
+        else:
+            size = "未确认"
         lines.append(f"- {cell(item['path'])}：{size}（{item['status']}）")
     lines += ["", "## 未覆盖与补查", ""]
     for gap in result["coverage_gaps"]:
@@ -119,7 +162,7 @@ def report(result):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--preferences", default=str(DEFAULT_PREFERENCES))
+    parser.add_argument("--preferences", default=None)
     parser.add_argument("--quick", action="store_true", help="Skip peripheral, backup and service detail")
     parser.add_argument("--online", action="store_true", help="Also ask softwareupdate for matching OS updates")
     parser.add_argument("--apps-only", action="store_true", help="Only read app metadata; no system audit commands (plutil may parse legacy plists)")
@@ -128,6 +171,8 @@ def main():
     parser.add_argument("--output", help="Create a new private JSON file; never overwrite")
     parser.add_argument("--report", help="Create a new Chinese Markdown report")
     args = parser.parse_args()
+    explicit_prefs = args.preferences is not None
+    args.preferences = args.preferences or str(DEFAULT_PREFERENCES)
     try:
         if not args.apps_only and platform.system() != "Darwin":
             raise ValueError("Host audit requires macOS; use --apps-only for fixtures")
@@ -138,8 +183,12 @@ def main():
             ["~/Library/Caches", "~/Library/Logs", "~/Downloads"])
         gaps.extend({"check": key, "status": value["status"]} for key, value in checks.items()
                     if value["status"] != "ok")
-        gaps.extend({"path": item["path"], "reason": "storage_scan_incomplete"}
+        gaps.extend({"path": item["path"], "reason": "storage_scan_incomplete",
+                     **({"partial_allocated_bytes": item["partial_allocated_bytes"]}
+                        if item.get("partial_allocated_bytes") is not None else {})}
                     for item in storage if item["status"] != "ok")
+        if not explicit_prefs and LOCAL_PREFERENCES.exists():
+            gaps.append({"reason": "Local preferences file config/preferences.local.json exists but was not passed via --preferences"})
         gaps += [{"reason": "App update availability, architecture, signing, project compatibility and vendor firmware matching require targeted checks"},
                  {"reason": "Background items, active remote connections, full backups, external volumes and user data are not exhaustively inventoried"}]
         if not args.online:

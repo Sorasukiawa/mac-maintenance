@@ -155,6 +155,8 @@ class MaintenanceTests(unittest.TestCase):
         result = self.cli("cleanup.py", "verify", "--plan", plan,
                           "--preferences", self.prefs, expected=2)
         self.assertFalse(result["preferences_unchanged"])
+        self.assertFalse(result["targets"][0]["unchanged"])
+        self.assertTrue(result["targets"][0]["policy_blocked"])
 
     def test_unchanged_snapshot_can_be_revalidated(self):
         _, plan = self.preview()
@@ -348,6 +350,58 @@ class MaintenanceTests(unittest.TestCase):
         r = self.cli("cleanup.py", "preview", "--targets", src, "--preferences", self.prefs)
         self.assertIsNone(r["total_target_allocated_bytes"])
 
+    def test_empty_display_name_falls_back_and_extracts_executable(self):
+        app = self.base / "Fallback.app"
+        info = app / "Contents" / "Info.plist"
+        info.parent.mkdir(parents=True)
+        info.write_bytes(plistlib.dumps({
+            "CFBundleIdentifier": "example.fallback",
+            "CFBundleDisplayName": "",
+            "CFBundleName": "FallbackName",
+            "CFBundleExecutable": "FallbackBin",
+            "CFBundleShortVersionString": "1.0",
+            "CFBundleVersion": "10",
+        }))
+        parsed = common.app_info(app)
+        self.assertEqual(parsed["name"], "FallbackName")
+        self.assertEqual(parsed["executable"], "FallbackBin")
+
+    def test_record_rejects_missing_move_destination_even_when_source_present(self):
+        _, plan = self.preview()
+        results = self.base / "results.json"
+        results.write_text(json.dumps({"version": 1, "results": [{"id": "cache", "action": "moved"}]}))
+        self.cli("cleanup.py", "record", "--plan", plan, "--results", results,
+                 "--log", self.base / "actions.jsonl", expected=2)
+
+    def test_record_marks_blocked_plan_target_as_plan_was_blocked(self):
+        self.config["protect_paths"] = [str(self.cache)]
+        self.prefs.write_text(json.dumps(self.config))
+        _, plan = self.preview()
+        os.remove(self.cache / "entry.bin")
+        self.cache.rmdir()
+        results = self.base / "results.json"
+        results.write_text(json.dumps({"version": 1, "results": [{"id": "cache", "action": "removed"}]}))
+        r = self.cli("cleanup.py", "record", "--plan", plan, "--results", results,
+                     "--log", self.base / "actions.jsonl")
+        self.assertEqual(r["events"][0]["observed_status"], "plan_was_blocked")
+        self.assertIsNone(r["events"][0]["target_bytes_removed"])
+
+    def test_redact_text_masks_uuids_and_backup_hostnames(self):
+        raw = 'DestinationID = "12345678-ABCD-1234-EF00-1234567890AB";\n/Volumes/Backup/Backups.backupdb/My-MacBook-Pro/2026-10-22'
+        cleaned = common.redact_text(raw)
+        self.assertNotIn("12345678-ABCD-1234-EF00-1234567890AB", cleaned)
+        self.assertNotIn("My-MacBook-Pro", cleaned)
+        self.assertIn("<redacted-uuid>", cleaned)
+        self.assertIn("Backups.backupdb/<redacted-host>/2026-10-22", cleaned)
+
+    def test_audit_report_renders_table_and_handles_missing_apps(self):
+        report_file = self.base / "audit.md"
+        self.cli("audit.py", "--apps-only", "--app-root", self.base / "none",
+                 "--preferences", self.prefs, "--report", report_file)
+        text = report_file.read_text(encoding="utf-8")
+        self.assertIn("| 检查 | 状态 | 摘要 |", text)
+
 
 if __name__ == "__main__":
     unittest.main()
+

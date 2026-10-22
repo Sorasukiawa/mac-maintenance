@@ -13,6 +13,7 @@ import time
 from xml.parsers.expat import ExpatError
 
 DEFAULT_PREFERENCES = Path(__file__).resolve().parents[1] / "config/preferences.json"
+LOCAL_PREFERENCES = Path(__file__).resolve().parents[1] / "config/preferences.local.json"
 
 
 def now():
@@ -75,7 +76,7 @@ def emit(value, output=None):
     print(text, end="")
 
 
-def command(argv, timeout=15, limit=512 * 1024):
+def command(argv, timeout=15, limit=2 * 1024 * 1024):
     """Bound time/output; no shell or automatic package-manager refresh."""
     started = time.monotonic()
     result = {"argv": argv, "checked_at": now()}
@@ -87,7 +88,10 @@ def command(argv, timeout=15, limit=512 * 1024):
                     process.wait(timeout=timeout)
                     result["status"] = "ok" if process.returncode == 0 else "unknown"
                 except subprocess.TimeoutExpired:
-                    os.killpg(process.pid, signal.SIGKILL)
+                    try:
+                        os.killpg(process.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
                     process.wait()
                     result["status"] = "timeout"
                 result["returncode"] = process.returncode
@@ -116,12 +120,20 @@ def redact_hardware(value):
     return value
 
 
+def redact_text(text):
+    """Mask UUIDs and backup machine-name path segments in unstructured command output."""
+    import re
+    text = re.sub(r"\b[0-9A-Fa-f]{8}-(?:[0-9A-Fa-f]{4}-){3}[0-9A-Fa-f]{12}\b", "<redacted-uuid>", text)
+    text = re.sub(r"(Backups\.backupdb/)[^/\n\"']+", r"\1<redacted-host>", text)
+    return text
+
+
 def read_plist(path):
     try:
         with open(path, "rb") as handle:
             return plistlib.load(handle)
     except (plistlib.InvalidFileException, ValueError, ExpatError):
-        result = command(["/usr/bin/plutil", "-convert", "json", "-o", "-", str(path)])
+        result = command(["/usr/bin/plutil", "-convert", "json", "-o", "-", "--", str(path)])
         if result["status"] != "ok":
             raise ValueError("plist unavailable or unsupported: " + str(path))
         return json.loads(result["stdout"])
@@ -138,10 +150,13 @@ def app_info(path):
     if info_path is None:
         raise ValueError("No readable, unlinked Info.plist: " + str(path))
     value = read_plist(info_path)
-    if not isinstance(value, dict) or not isinstance(value.get("CFBundleIdentifier"), str):
+    if not isinstance(value, dict) or not isinstance(value.get("CFBundleIdentifier"), str) or not value["CFBundleIdentifier"]:
         raise ValueError("Missing bundle ID: " + str(path))
+    display_name = str(value.get("CFBundleDisplayName") or "").strip()
+    bundle_name = str(value.get("CFBundleName") or "").strip()
     return {"path": str(path), "bundle_id": value["CFBundleIdentifier"],
-            "name": str(value.get("CFBundleDisplayName", value.get("CFBundleName", path.stem))),
+            "name": display_name or bundle_name or path.stem,
+            "executable": str(value.get("CFBundleExecutable") or "").strip(),
             "version": str(value.get("CFBundleShortVersionString", "")),
             "build": str(value.get("CFBundleVersion", "")),
             "minimum_system": str(value.get("LSMinimumSystemVersion", "")),
