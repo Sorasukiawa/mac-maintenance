@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import platform
 import re
 import stat
 import sys
@@ -14,18 +15,30 @@ from maintenance_common import (DEFAULT_PREFERENCES, absolute_path, app_info, co
     digest, emit, intersects, now, preferences, read_json, same_entry, snapshot, volume)
 
 
-def owner_check(names):
+def broad_roots():
+    home = Path.home()
+    return {
+        Path("/"), Path("/Applications"), Path("/System"), Path("/Library"),
+        Path("/Users"), Path("/Volumes"), Path("/System/Volumes/Data"),
+        Path("/private"), Path("/var"), Path("/tmp"), Path("/etc"),
+        home, home / "Applications", home / "Desktop", home / "Documents",
+        home / "Downloads", home / "Library", home / "Library/Application Support",
+        home / "Library/Caches", home / "Library/Containers", home / "Library/Logs",
+    }
+
+
+def owner_check(names, ps_result=None):
     if not names:
         return {"status": "not_checked", "reason": "Owner processes were not supplied"}
     if not isinstance(names, list) or any(not isinstance(n, str) or not n or "/" in n for n in names):
         raise ValueError("owner_processes must be a list of exact executable basenames")
-    result = command(["/bin/ps", "-axo", "comm="], 10)
+    result = ps_result if ps_result is not None else command(["/bin/ps", "-axo", "comm="], 10)
     if result["status"] != "ok" or result.get("stderr"):
         return {"status": "unknown", "evidence": result}
     running = {Path(line.strip()).name for line in result["stdout"].splitlines()}
     active = sorted(set(names) & running)
     return {"status": "active" if active else "not_observed", "names": names,
-            "active": active, "checked_at": now(), "handles_checked": False}
+            "active": active, "checked_at": result.get("checked_at") or now(), "handles_checked": False}
 
 
 def replacement_check(item, prefs):
@@ -53,6 +66,13 @@ def replacement_check(item, prefs):
         width = max(len(left), len(right))
         if old["bundle_id"] != new["bundle_id"] or right + (0,) * (width - len(right)) <= left + (0,) * (width - len(left)):
             raise ValueError("Replacement is not a newer version of the same bundle ID")
+        host_mac = platform.mac_ver()[0]
+        if new.get("minimum_system") and host_mac and \
+           re.fullmatch(r"\d+(?:\.\d+)*", new["minimum_system"]) and re.fullmatch(r"\d+(?:\.\d+)*", host_mac):
+            req, cur = version(new["minimum_system"]), version(host_mac)
+            sys_width = max(len(req), len(cur))
+            if cur + (0,) * (sys_width - len(cur)) < req + (0,) * (sys_width - len(req)):
+                raise ValueError("Replacement requires macOS " + new["minimum_system"] + " or newer")
         evidence = snapshot(str(new_path))
         if evidence["status"] != "ok":
             raise ValueError("Replacement snapshot incomplete")
@@ -79,6 +99,9 @@ def load_targets(path):
         absolute_path(item["path"])
         if item["kind"] not in ("cache", "obsolete_app", "installer", "user_selected"):
             raise ValueError("Unsupported target kind")
+        owners = item.get("owner_processes")
+        if owners is not None and (not isinstance(owners, list) or any(not isinstance(n, str) or not n or "/" in n for n in owners)):
+            raise ValueError("owner_processes must be a list of exact executable basenames")
     return value["targets"]
 
 
@@ -86,11 +109,10 @@ def preview(args):
     prefs = preferences(args.preferences)
     items = load_targets(args.targets)
     protected = [Path(p).expanduser().resolve() for p in prefs["protect_paths"]]
-    broad = {Path("/"), Path("/Applications"), Path.home(), Path.home() / "Library",
-             Path("/System"), Path("/Library"), Path("/Users"), Path("/Volumes"),
-             Path("/System/Volumes/Data"), Path.home() / "Library/Caches"}
+    broad = broad_roots()
     targets = []
     paths = [absolute_path(item["path"]) for item in items]
+    ps_result = command(["/bin/ps", "-axo", "comm="], 10) if any(item.get("owner_processes") for item in items) else None
     for index, (item, path) in enumerate(zip(items, paths)):
         reasons = []
         overlaps = any(index != other and intersects(path, candidate) for other, candidate in enumerate(paths))
@@ -104,7 +126,7 @@ def preview(args):
         snap = {"status": "blocked", "allocated_bytes": None} if reasons else snapshot(str(path))
         if snap["status"] != "ok":
             reasons.append("snapshot_" + snap["status"])
-        owners = owner_check(item.get("owner_processes"))
+        owners = owner_check(item.get("owner_processes"), ps_result=ps_result)
         if owners["status"] in ("active", "unknown"):
             reasons.append("owner_" + owners["status"])
         replacement = replacement_check(item, prefs)
@@ -139,19 +161,26 @@ def verify(args):
     plan = load_plan(args.plan)
     prefs = preferences(args.preferences)
     prefs_same = digest(prefs) == plan["preferences_digest"]
+    protected = [Path(p).expanduser().resolve() for p in prefs["protect_paths"]]
+    broad = broad_roots()
+    ps_result = command(["/bin/ps", "-axo", "comm="], 10) if any(
+        t.get("request", {}).get("owner_processes") for t in plan["targets"]) else None
     checks = []
     for target in plan["targets"]:
+        path = absolute_path(target["path"])
+        policy_blocked = any(same_entry(path, root) for root in broad) or \
+                         any(intersects(path.resolve(), candidate) for candidate in protected)
         current = snapshot(target["path"])
-        owners = owner_check(target["request"].get("owner_processes"))
+        owners = owner_check(target["request"].get("owner_processes"), ps_result=ps_result)
         replacement = replacement_check(target["request"], prefs)
         previous_replacement = target["replacement_check"]
         replacement_same = replacement.get("status") == previous_replacement.get("status") and \
             replacement.get("snapshot", {}).get("fingerprint") == previous_replacement.get("snapshot", {}).get("fingerprint")
-        unchanged = target["status"] != "blocked" and current["status"] == "ok" and \
+        unchanged = target["status"] != "blocked" and not policy_blocked and current["status"] == "ok" and \
             current["fingerprint"] == target["snapshot"].get("fingerprint") and \
             owners["status"] not in ("active", "unknown") and replacement_same
-        checks.append({"id": target["id"], "unchanged": unchanged, "snapshot": current,
-                       "owner_check": owners, "replacement_unchanged": replacement_same})
+        checks.append({"id": target["id"], "unchanged": unchanged, "policy_blocked": policy_blocked,
+                       "snapshot": current, "owner_check": owners, "replacement_unchanged": replacement_same})
     unchanged = prefs_same and all(item["unchanged"] for item in checks)
     emit({"version": 1, "plan_id": plan["plan_id"], "checked_at": now(), "unchanged": unchanged,
           "preferences_unchanged": prefs_same, "targets": checks,
@@ -196,18 +225,25 @@ def record(args):
         if not isinstance(supplied, dict) or supplied.get("id") not in indexed or supplied["id"] in seen:
             raise ValueError("Unknown or duplicate result target")
         seen.add(supplied["id"])
-        target = indexed[supplied["id"]]
         if supplied.get("action") not in ("removed", "moved", "manual", "skipped"):
             raise ValueError("Unsupported recorded action")
+        if supplied["action"] == "moved":
+            if not isinstance(supplied.get("destination"), str) or not supplied["destination"]:
+                raise ValueError("Moved action requires an absolute destination path")
+            absolute_path(supplied["destination"])
+    for supplied in results["results"]:
+        target = indexed[supplied["id"]]
         current, before = snapshot(target["path"]), target["snapshot"]
         status, removed = "reported_only", None
         destination = None
-        if current["status"] == "missing" and supplied["action"] == "removed":
+        if (target.get("status") == "blocked" or before.get("status") != "ok") and supplied["action"] in ("removed", "moved"):
+            status = "plan_was_blocked"
+        elif current["status"] == "missing" and supplied["action"] == "removed":
             status, removed = "observed_absent", before.get("allocated_bytes")
         elif current["status"] == "ok" and supplied["action"] in ("removed", "moved"):
             status, removed = "still_present", 0
         elif current["status"] == "missing" and supplied["action"] == "moved":
-            destination = snapshot(str(absolute_path(supplied.get("destination", ""))))
+            destination = snapshot(str(absolute_path(supplied["destination"])))
             if destination["status"] == "ok" and (destination["device"], destination["inode"]) == (before.get("device"), before.get("inode")):
                 status, removed = "moved_same_volume", 0
             else:
@@ -222,9 +258,9 @@ def record(args):
                        "recorded_at": now(), "id": supplied["id"], "path": target["path"],
                        "reported": supplied, "observed_status": status, "snapshot_after": current,
                        "destination_snapshot": destination, "target_bytes_removed": removed,
-                       "source_path_bytes_decrease": before.get("allocated_bytes") if current["status"] == "missing"
+                       "source_path_bytes_decrease": before.get("allocated_bytes") if current["status"] == "missing" and before.get("status") == "ok"
                            else max(0, before["allocated_bytes"] - current["allocated_bytes"])
-                           if current["status"] == before["status"] == "ok" else None,
+                           if current["status"] == before.get("status") == "ok" else None,
                        "volume_available_delta_bytes": delta, "reclaimed_bytes": None,
                        "note": "Target disappearance and volume free-space delta are separate observations; neither proves attributable APFS reclamation."})
     append_log(args.log, events)

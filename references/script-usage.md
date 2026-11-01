@@ -15,7 +15,7 @@
 - 去掉 `--quick`：再查扩展、备份状态/最近备份、开发目录、Homebrew 服务和支持的 USB/Thunderbolt/显示器类型。
 - `--online`：额外运行 `softwareupdate --list`，45 秒超时单独记录。不安装系统更新，也不切换更新通道。
 - `--apps-only`：只读应用 plist，不运行系统体检命令；遇到 OpenStep plist 时可能调用系统 `plutil` 只读转换。`--app-root /absolute/path` 可重复；默认 `/Applications`、`~/Applications`，扫描深度 3、条目最多 10,000。遇到 `.app` 停止递归，读取 iOS 包装应用，跳过链接并记录覆盖缺口。
-- `--storage-root /absolute/path` 可重复；默认只统计用户 Caches、Logs、Downloads，单目录命令限时 15 秒。统计可能重叠，不计算“可释放总量”。`du` 的任何错误都不记成零。
+- `--storage-root /absolute/path` 可重复；默认只统计用户 Caches、Logs、Downloads，单目录命令限时 15 秒。统计可能重叠，不计算“可释放总量”。`du` 的任何错误都不记成零（`allocated_bytes` 保持 `null`；若部分子目录可读，另在 `partial_allocated_bytes` 记录已读下界）。
 - `--preferences FILE` 使用本任务配置，便于落实当前指令且不改长期偏好。
 
 JSON 始终输出到 stdout；`--output` 与 `--report` 额外创建权限 0600 的新文件，已有路径不覆盖。输出失败返回 2；体检部分超时、权限不足、工具缺失写入 `coverage_gaps`，报告仍可生成并返回 0，必须检查各项状态。
@@ -98,6 +98,7 @@ JSON 始终输出到 stdout；`--output` 与 `--report` 额外创建权限 0600 
 | `still_present` | 声明已删除/移动，但原目标仍存在 |
 | `moved_same_volume` | 原路径缺失，目标卷与 inode 匹配；目标删除量记 0 |
 | `move_not_verified` / `observation_incomplete` | 证据不足、路径异常或扫描不完整 |
+| `plan_was_blocked` | 计划阶段该目标已被阻塞（无有效基线快照），不认定为已验证的删除或移动 |
 | `reported_only` | 仅记录手工操作/跳过声明，没有提升为验证完成 |
 | `source_path_bytes_decrease` | 原路径的统计减少量，同卷移走也计入；不是释放量 |
 | `target_bytes_removed` | 按动作及观察记录为删除的目标统计量，同卷移动为 0，未确认为 `null`；不等于物理释放 |
