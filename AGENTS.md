@@ -1,6 +1,6 @@
 # macOS 维护技能开发约定
 
-技能入口为 `SKILL.md`，详细流程见 `references/`，脚本位于 `scripts/`。源码与个人安装实例分别维护，合并更新前比较个人 `config/preferences.json`。
+技能入口为 `SKILL.md`，详细流程见 `references/`，脚本位于 `scripts/`。源码与个人安装实例分别维护：个人偏好放在被忽略的 `config/preferences.local.json`（从 `config/preferences.example.json` 复制），`config/preferences.json` 是通用默认，不写个人排除。
 
 - Python 脚本使用标准库；回归入口为 `python3 -B -m unittest discover -s tests -q`，使用隔离夹具。
 - 采集脚本不安装、删除、停止或启动真实服务；预览和重新核对不等于执行授权。查询失败、部分结果和覆盖缺口保留原状态。
